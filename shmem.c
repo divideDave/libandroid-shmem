@@ -1,4 +1,7 @@
-#include <android/log.h>
+//#include <android/log.h>
+#define _POSIX_C_SOURCE 200809L // DJM added this to resolve implisit decl compiler errors. Work around feature macros in system headers. 
+#include <unistd.h>
+#include <sys/types.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -9,18 +12,26 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <unistd.h>
 #include <paths.h>
+#include <fcntl.h>      // DJM open(), O_RDWR
+#include <sys/ioctl.h>  // DJM ioctl()
 
 #define __u32 uint32_t
-#include <linux/ashmem.h>
-
+#include "ashmem.h"
 #include "shm.h"
 
-#define DBG(...) __android_log_print(ANDROID_LOG_INFO, "shmem", __VA_ARGS__)
+#define DBG(fmt, ...) printf(fmt "\n", ##__VA_ARGS__)
 #define ASHV_KEY_SYMLINK_PATH _PATH_TMP "ashv_key_%d"
 #define ANDROID_SHMEM_SOCKNAME "/dev/shm/%08x"
 #define ROUND_UP(N, S) ((((N) + (S) - 1) / (S)) * (S))
+#ifndef TEMP_FAILURE_RETRY
+#define TEMP_FAILURE_RETRY(exp) ({         \
+    __typeof__ (exp) _rc;                      \
+    do {                                   \
+        _rc = (exp);                       \
+    } while (_rc == -1 && errno == EINTR); \
+    _rc; })
+#endif
 
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -48,6 +59,7 @@ static pthread_t ashv_listening_thread_id = 0;
 
 static int ancil_send_fd(int sock, int fd)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
 	char nothing = '!';
 	struct iovec nothing_ptr = { .iov_base = &nothing, .iov_len = 1 };
 
@@ -77,6 +89,7 @@ static int ancil_send_fd(int sock, int fd)
 
 static int ancil_recv_fd(int sock)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
 	char nothing = '!';
 	struct iovec nothing_ptr = { .iov_base = &nothing, .iov_len = 1 };
 
@@ -108,6 +121,7 @@ static int ancil_recv_fd(int sock)
 
 static int ashmem_get_size_region(int fd)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
 	//int ret = __ashmem_is_ashmem(fd, 1);
 	//if (ret < 0) return ret;
 	return TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_GET_SIZE, NULL));
@@ -124,6 +138,7 @@ static int ashmem_get_size_region(int fd)
  */
 static int ashmem_create_region(char const* name, size_t size)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
 	int fd = open("/dev/ashmem", O_RDWR);
 	if (fd < 0) return fd;
 
@@ -132,7 +147,12 @@ static int ashmem_create_region(char const* name, size_t size)
 	name_buffer[sizeof(name_buffer)-1] = 0;
 
 	int ret = ioctl(fd, ASHMEM_SET_NAME, name_buffer);
-	if (ret < 0) goto error;
+	if (ret < 0) {
+        DBG("ioctl ASHMEM_SET_NAME fails in %s\n",__FUNCTION__);
+		perror("ioctl ASHMEM_SET_NAME");
+        goto error;
+    }
+    
 
 	ret = ioctl(fd, ASHMEM_SET_SIZE, size);
 	if (ret < 0) goto error;
@@ -145,6 +165,7 @@ error:
 
 static void ashv_check_pid()
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
 	pid_t mypid = getpid();
 	if (ashv_pid_setup == 0) {
 		ashv_pid_setup = mypid;
@@ -167,16 +188,21 @@ static void ashv_check_pid()
 // higher 16 bits.
 static int ashv_shmid_from_counter(unsigned int counter)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
 	return ashv_local_socket_id * 0x10000 + counter;
 }
 
 static int ashv_socket_id_from_shmid(int shmid)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	return shmid / 0x10000;
 }
 
 static int ashv_find_local_index(int shmid)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	for (size_t i = 0; i < shmem_amount; i++)
 		if (shmem[i].id == shmid)
 			return i;
@@ -185,12 +211,14 @@ static int ashv_find_local_index(int shmid)
 
 static void* ashv_thread_function(void* arg)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	int sock = *(int*)arg;
 	free(arg);
 	struct sockaddr_un addr;
 	socklen_t len = sizeof(addr);
 	int sendsock;
-	//DBG("%s: thread started", __PRETTY_FUNCTION__);
+	DBG("%s: thread started", __PRETTY_FUNCTION__);
 	while ((sendsock = accept(sock, (struct sockaddr *)&addr, &len)) != -1) {
 		int shmid;
 		if (recv(sendsock, &shmid, sizeof(shmid), 0) != sizeof(shmid)) {
@@ -220,6 +248,8 @@ static void* ashv_thread_function(void* arg)
 
 static void android_shmem_delete(int idx)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	if (shmem[idx].descriptor) close(shmem[idx].descriptor);
 	shmem_amount--;
 	memmove(&shmem[idx], &shmem[idx+1], (shmem_amount - idx) * sizeof(shmem_t));
@@ -227,6 +257,8 @@ static void android_shmem_delete(int idx)
 
 static int ashv_read_remote_segment(int shmid)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	struct sockaddr_un addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
@@ -286,6 +318,8 @@ static int ashv_read_remote_segment(int shmid)
 /* Get shared memory area identifier. */
 int shmget(key_t key, size_t size, int flags)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	(void) flags;
 
 	ashv_check_pid();
@@ -386,8 +420,9 @@ int shmget(key_t key, size_t size, int flags)
 		shmid = ashv_shmid_from_counter(shmem_counter);
 	}
 
+	long page_size = sysconf(_SC_PAGESIZE);
 	shmem = realloc(shmem, shmem_amount * sizeof(shmem_t));
-	size = ROUND_UP(size, getpagesize());
+	size = ROUND_UP(size, page_size);
 	shmem[idx].size = size;
 	shmem[idx].descriptor = ashmem_create_region(buf, size);
 	shmem[idx].addr = NULL;
@@ -402,7 +437,7 @@ int shmget(key_t key, size_t size, int flags)
 		pthread_mutex_unlock (&mutex);
 		return -1;
 	}
-	//DBG("%s: ID %d shmid %x FD %d size %zu", __PRETTY_FUNCTION__, idx, shmid, shmem[idx].descriptor, shmem[idx].size);
+	DBG("%s: ID %d shmid %x FD %d size %zu", __PRETTY_FUNCTION__, idx, shmid, shmem[idx].descriptor, shmem[idx].size);
 	/*
 	status = ashmem_set_prot_region (shmem[idx].descriptor, 0666);
 	if (status < 0) {
@@ -431,6 +466,8 @@ int shmget(key_t key, size_t size, int flags)
 /* Attach shared memory segment. */
 void* shmat(int shmid, void const* shmaddr, int shmflg)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	ashv_check_pid();
 
 	int socket_id = ashv_socket_id_from_shmid(shmid);
@@ -467,6 +504,8 @@ void* shmat(int shmid, void const* shmaddr, int shmflg)
 /* Detach shared memory segment. */
 int shmdt(void const* shmaddr)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	ashv_check_pid();
 
 	pthread_mutex_lock(&mutex);
@@ -495,6 +534,8 @@ int shmdt(void const* shmaddr)
 /* Shared memory control operation. */
 int shmctl(int shmid, int cmd, struct shmid_ds *buf)
 {
+	DBG("%s" , __PRETTY_FUNCTION__);
+
 	ashv_check_pid();
 
 	if (cmd == IPC_RMID) {
@@ -537,13 +578,13 @@ int shmctl(int shmid, int cmd, struct shmid_ds *buf)
 		memset(buf, 0, sizeof(struct shmid_ds));
 		buf->shm_segsz = shmem[idx].size;
 		buf->shm_nattch = 1;
-		buf->shm_perm.key = shmem[idx].key;
+		buf->shm_perm.__key = shmem[idx].key;
 		buf->shm_perm.uid = geteuid();
 		buf->shm_perm.gid = getegid();
 		buf->shm_perm.cuid = geteuid();
 		buf->shm_perm.cgid = getegid();
 		buf->shm_perm.mode = 0666;
-		buf->shm_perm.seq = 1;
+		buf->shm_perm.__seq = 1;
 
 		pthread_mutex_unlock (&mutex);
 		return 0;
